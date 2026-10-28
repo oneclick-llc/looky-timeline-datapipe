@@ -61,9 +61,6 @@ def test_changed_idx_transaction_is_closed_while_chunks_are_processed(dbconn) ->
 BIG_ID = 2**53 + 1  # not representable as float64
 
 
-# On Postgres the changed-idx query cannot run for a non-text join key yet: the deleted-records CTE
-# selects an untyped NULL for it, and UNION fails with "bigint and text cannot be matched".
-@pytest.mark.skipif(os.environ.get("TEST_DB_ENV") != "sqlite", reason="needs a non-text join key, see above")
 def test_bigint_join_key_survives_null_in_another_chunk(dbconn) -> None:
     ds = DataStore(dbconn, create_meta_table=True)
     users = ds.create_table(
