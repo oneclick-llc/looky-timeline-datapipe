@@ -395,10 +395,12 @@ class BaseBatchTransformStep(ComputeStep):
                     # AICODE-NOTE: the transaction must end before the first chunk is yielded. Yielding
                     # inside it kept an "idle in transaction" session for the whole run (hours for long
                     # steps), which held back vacuum for the entire database and blocked DDL on the meta
-                    # tables. psycopg2 buffers the whole result client-side anyway, so reading it at once
-                    # costs no extra round trips.
+                    # tables. psycopg2 buffers the whole result client-side anyway, so reading the rows
+                    # at once costs no extra round trips.
                     with ds.meta_dbconn.con.begin() as con:
-                        idx_df = pd.read_sql_query(u1, con=con)
+                        result = con.execute(u1)
+                        columns = list(result.keys())
+                        rows = result.fetchall()
 
                     query_exec_time = time.time() - start_time
                     logger.debug(
@@ -406,18 +408,22 @@ class BaseBatchTransformStep(ComputeStep):
                         f"rows: {idx_count}"
                     )
 
-                # Используем join_keys (которые включают transform_keys + additional_columns)
-                # Фильтруем только колонки, которые есть в df
-                available_keys = [k for k in join_keys if k in idx_df.columns]
-                idx_df = idx_df[available_keys]
+                # AICODE-NOTE: build a frame per chunk, as pd.read_sql_query(chunksize=...) did. A frame
+                # over the whole result infers dtypes across all chunks: a NULL in one chunk turns an
+                # integer key column into float64 and rounds ids above 2**53 in every other chunk.
+                # An empty result still yields one empty frame.
+                for start in range(0, max(len(rows), 1), chunk_size):
+                    df = pd.DataFrame.from_records(rows[start : start + chunk_size], columns=columns, coerce_float=True)
 
-                for k, v in extra_filters.items():
-                    idx_df[k] = v
+                    # Используем join_keys (которые включают transform_keys + additional_columns)
+                    # Фильтруем только колонки, которые есть в df
+                    available_keys = [k for k in join_keys if k in df.columns]
+                    df = df[available_keys]
 
-                # Same chunks as pd.read_sql_query(chunksize=...): each one indexed from 0, and an
-                # empty result still yields one empty frame.
-                for start in range(0, max(len(idx_df), 1), chunk_size):
-                    yield cast(IndexDF, idx_df.iloc[start : start + chunk_size].reset_index(drop=True))
+                    for k, v in extra_filters.items():
+                        df[k] = v
+
+                    yield cast(IndexDF, df)
 
             return math.ceil(idx_count / chunk_size), alter_res_df()
 

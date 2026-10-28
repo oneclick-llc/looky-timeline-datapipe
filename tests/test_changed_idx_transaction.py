@@ -3,7 +3,7 @@ from typing import List
 
 import pandas as pd
 import pytest
-from sqlalchemy import Column, Integer, text
+from sqlalchemy import BigInteger, Column, Integer, String, text
 
 from datapipe.compute import ComputeInput
 from datapipe.datatable import DataStore
@@ -56,3 +56,66 @@ def test_changed_idx_transaction_is_closed_while_chunks_are_processed(dbconn) ->
     assert [len(c) for c in chunks] == [3, 3, 3, 1]
     assert sorted(pd.concat(chunks)["id"]) == list(range(10))
     assert all(list(c.index) == list(range(len(c))) for c in chunks)
+
+
+BIG_ID = 2**53 + 1  # not representable as float64
+
+
+# On Postgres the changed-idx query cannot run for a non-text join key yet: the deleted-records CTE
+# selects an untyped NULL for it, and UNION fails with "bigint and text cannot be matched".
+@pytest.mark.skipif(os.environ.get("TEST_DB_ENV") != "sqlite", reason="needs a non-text join key, see above")
+def test_bigint_join_key_survives_null_in_another_chunk(dbconn) -> None:
+    ds = DataStore(dbconn, create_meta_table=True)
+    users = ds.create_table(
+        "users",
+        TableStoreDB(
+            dbconn, "users", [Column("id", BigInteger, primary_key=True), Column("name", String)], create_table=True
+        ),
+    )
+    subs = ds.create_table(
+        "subs",
+        TableStoreDB(
+            dbconn,
+            "subs",
+            [Column("id", String, primary_key=True), Column("follower_id", BigInteger)],
+            create_table=True,
+        ),
+    )
+    out = ds.create_table(
+        "out",
+        TableStoreDB(
+            dbconn, "out", [Column("id", String, primary_key=True), Column("name", String)], create_table=True
+        ),
+    )
+
+    def enrich(subs_df, followers_df):
+        res = subs_df.merge(followers_df, left_on="follower_id", right_on="id", suffixes=("", "_user"))
+        return res[["id", "name"]]
+
+    step = BatchTransformStep(
+        ds=ds,
+        name="enrich",
+        func=enrich,
+        input_dts=[
+            ComputeInput(dt=subs, join_type="full"),
+            ComputeInput(dt=users, join_type="full", join_keys={"follower_id": "id"}),
+        ],
+        output_dts=[out],
+        transform_keys=["id"],
+        use_offset_optimization=True,
+        chunk_size=1,
+    )
+
+    users.store_chunk(pd.DataFrame({"id": [BIG_ID, BIG_ID + 2], "name": ["big", "bigger"]}))
+    subs.store_chunk(pd.DataFrame({"id": ["s1", "s2"], "follower_id": [BIG_ID, BIG_ID]}))
+    step.run_full(ds)
+
+    # s1 is deleted, so its follower_id comes back as NULL; s2 now follows a different big id.
+    subs.delete_by_idx(pd.DataFrame({"id": ["s1"]}))
+    subs.store_chunk(pd.DataFrame({"id": ["s2"], "follower_id": [BIG_ID + 2]}))
+
+    _count, idx_gen = step.get_full_process_ids(ds)
+    chunks = list(idx_gen)
+
+    follower_ids = {row["id"]: row["follower_id"] for chunk in chunks for row in chunk.to_dict("records")}
+    assert follower_ids["s2"] == BIG_ID + 2
