@@ -1114,6 +1114,29 @@ def _meta_sql_helper(
     return sql
 
 
+def _null_key(k: str, key_types: Optional[Dict[str, Any]]) -> Any:
+    """NULL для ключа, которого нет в таблицах ветки, с типом этого ключа, если он известен."""
+    # AICODE-NOTE: Postgres resolves an untyped NULL in a CTE as text, so a non-text join key (e.g. a
+    # BIGINT FK) made the changed-idx UNION fail with "UNION types bigint and text cannot be matched".
+    if key_types is not None and k in key_types:
+        return sa.cast(sa.null(), key_types[k]).label(k)
+    return sa.literal(None).label(k)
+
+
+def _collect_key_types(input_dts: List["ComputeInput"], keys: List[str]) -> Dict[str, Any]:
+    """Типы ключей из колонок meta и data таблиц входов."""
+    key_types: Dict[str, Any] = {}
+    for inp in input_dts:
+        tables = [inp.dt.meta_table.sql_table, getattr(inp.dt.table_store, "data_table", None)]
+        for tbl in tables:
+            if tbl is None:
+                continue
+            for col in tbl.columns:
+                if col.name in keys and col.name not in key_types:
+                    key_types[col.name] = col.type
+    return key_types
+
+
 def _meta_data_sql_helper(
     tbl: Any,
     data_tbl: Any,
@@ -1154,7 +1177,7 @@ def _meta_data_sql_helper(
 
     # CTE для удаленных записей
     deleted_select_cols = [
-        tbl.c[k] if k in keys_in_meta else sa.literal(None).label(k)
+        tbl.c[k] if k in keys_in_meta else _null_key(k, {k: data_tbl.c[k].type})
         for k in all_keys
     ]
 
@@ -1250,6 +1273,7 @@ def _build_reverse_meta_cte(
     offset: float,
     filters_idx: Optional[IndexDF],
     run_config: Optional[RunConfig],
+    key_types: Optional[Dict[str, Any]] = None,
 ) -> Optional[Any]:
     """
     ПУТЬ А для reverse join: JOIN meta справочника с meta основной таблицы.
@@ -1276,7 +1300,7 @@ def _build_reverse_meta_cte(
             select_cols.append(ref_meta_tbl.c[k].label(k))
             group_by_cols.append(ref_meta_tbl.c[k])
         else:
-            select_cols.append(sa.literal(None).label(k))
+            select_cols.append(_null_key(k, key_types))
 
     join_conditions = [
         primary_meta_tbl.c[primary_col] == ref_meta_tbl.c[ref_col]
@@ -1329,6 +1353,7 @@ def _build_reverse_data_cte(
     offset: float,
     filters_idx: Optional[IndexDF],
     run_config: Optional[RunConfig],
+    key_types: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[Any]]:
     """
     ПУТЬ Б для reverse join: JOIN meta справочника с data основной таблицы.
@@ -1361,7 +1386,7 @@ def _build_reverse_data_cte(
             select_cols.append(ref_meta_tbl.c[k].label(k))
             group_by_cols.append(ref_meta_tbl.c[k])
         else:
-            select_cols.append(sa.literal(None).label(k))
+            select_cols.append(_null_key(k, key_types))
 
     join_conditions = [
         primary_data_tbl.c[primary_col] == ref_meta_tbl.c[ref_col]
@@ -1421,7 +1446,7 @@ def _build_reverse_data_cte(
             deleted_select_cols.append(ref_meta_tbl.c[k])
         else:
             # FK из primary_data недоступен для deleted records
-            deleted_select_cols.append(sa.literal(None).label(k))
+            deleted_select_cols.append(_null_key(k, key_types))
 
     # JOIN primary_meta с ref_meta_tbl для deleted records
     deleted_join_conditions = [
@@ -1506,6 +1531,7 @@ def _build_reverse_input_cte(
     filters_idx: Optional[IndexDF],
     run_config: Optional[RunConfig],
     cte_name: str,
+    key_types: Optional[Dict[str, Any]] = None,
 ) -> List[Any]:
     """
     Строит CTE для reverse join (справочная таблица с join_keys).
@@ -1538,7 +1564,7 @@ def _build_reverse_input_cte(
         # ПУТЬ А: JOIN meta с meta (FK в primary_meta)
         changed_sql = _build_reverse_meta_cte(
             ref_meta_tbl, ref_join_keys, ref_primary_keys,
-            primary_meta_tbl, all_select_keys, offset, filters_idx, run_config
+            primary_meta_tbl, all_select_keys, offset, filters_idx, run_config, key_types
         )
         deleted_sql = None
     else:
@@ -1546,7 +1572,7 @@ def _build_reverse_input_cte(
         changed_sql, deleted_sql = _build_reverse_data_cte(
             ref_meta_tbl, ref_join_keys, ref_primary_keys,
             primary_meta_tbl, primary_store,
-            all_select_keys, offset, filters_idx, run_config
+            all_select_keys, offset, filters_idx, run_config, key_types
         )
 
     if changed_sql is None:
@@ -1566,6 +1592,7 @@ def _build_input_ctes(
     all_select_keys: List[str],
     filters_idx: Optional[IndexDF],
     run_config: Optional[RunConfig],
+    key_types: Optional[Dict[str, Any]] = None,
 ) -> List[Any]:
     """
     Строит CTE для каждой входной таблицы с фильтром по offset.
@@ -1625,6 +1652,7 @@ def _build_input_ctes(
                 filters_idx=filters_idx,
                 run_config=run_config,
                 cte_name=cte_name,
+                key_types=key_types,
             )
         else:
             # Forward join: находим изменения в самой primary таблице и зависимые referense записи
@@ -1642,6 +1670,7 @@ def _build_error_records_cte(
     transform_keys: List[str],
     all_select_keys: List[str],
     filters_idx: Optional[IndexDF],
+    key_types: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """
     Строит CTE для записей с ошибками из TransformMetaTable.
@@ -1659,7 +1688,7 @@ def _build_error_records_cte(
             if k == 'update_ts':
                 error_select_cols.append(sa.cast(sa.literal(None), sa.Float).label(k))
             else:
-                error_select_cols.append(sa.literal(None).label(k))
+                error_select_cols.append(_null_key(k, key_types))
 
     error_records_sql: Any = sa.select(*error_select_cols).select_from(tr_tbl).where(
         sa.or_(
@@ -1685,6 +1714,7 @@ def _union_or_cross_join_ctes(
     transform_keys: List[str],
     additional_columns: List[str],
     all_select_keys: List[str],
+    key_types: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Any, bool]:
     """
     Объединяет CTE через UNION или CROSS JOIN в зависимости от структуры ключей.
@@ -1743,7 +1773,7 @@ def _union_or_cross_join_ctes(
             union_parts = []
             for cte in changed_ctes:
                 select_cols = [
-                    cte.c[k] if k in cte.c else sa.literal(None).label(k)
+                    cte.c[k] if k in cte.c else _null_key(k, key_types)
                     for k in all_select_keys
                 ]
                 union_parts.append(sa.select(*select_cols).select_from(cte))
@@ -1908,6 +1938,8 @@ def build_changed_idx_sql_v2(
             if inp.dt.name not in offsets:
                 offsets[inp.dt.name] = 0.0
 
+    key_types = _collect_key_types(input_dts, all_select_keys)
+
     # 2. Построить CTE для каждой входной таблицы с фильтром по offset
     changed_ctes = _build_input_ctes(
         input_dts=input_dts,
@@ -1915,6 +1947,7 @@ def build_changed_idx_sql_v2(
         all_select_keys=all_select_keys,
         filters_idx=filters_idx,
         run_config=run_config,
+        key_types=key_types,
     )
 
     # 3. Построить CTE для error_records
@@ -1923,6 +1956,7 @@ def build_changed_idx_sql_v2(
         transform_keys=transform_keys,
         all_select_keys=all_select_keys,
         filters_idx=filters_idx,
+        key_types=key_types,
     )
 
     # 4. Объединить через UNION или CROSS JOIN
@@ -1933,6 +1967,7 @@ def build_changed_idx_sql_v2(
         transform_keys=transform_keys,
         additional_columns=additional_columns,
         all_select_keys=all_select_keys,
+        key_types=key_types,
     )
 
     # 5. Дедупликация если нужно
