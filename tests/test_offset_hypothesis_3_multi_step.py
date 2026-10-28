@@ -405,7 +405,7 @@ if __name__ == "__main__":
     from datapipe.store.database import DBConn
     from sqlalchemy import create_engine, text
 
-    DBCONNSTR = "postgresql://postgres:password@localhost:5432/postgres"
+    DBCONNSTR = "postgresql+psycopg2://postgres:password@localhost:5432/postgres"
     DB_TEST_SCHEMA = "test_hypothesis_3_multi_step"
 
     eng = create_engine(DBCONNSTR)

@@ -1,5 +1,8 @@
 # WIP: 0.14.6
 
+* Close the changed-idx transaction of `BatchTransformStep.get_full_process_ids`
+  before yielding chunks, so a long run no longer leaves an "idle in
+  transaction" session that holds back vacuum
 * Allow `DataTable` objects directly in `ComputeStep.input_dts` parameter
   (auto-wraps in `ComputeInput`)
 * Add backward compatibility for DataTable API in BatchTransformStep
