@@ -22,7 +22,8 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # setup-python has no 3.9 build for ubuntu-latest (26.04); the matrix still tests 3.9.
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         include:
