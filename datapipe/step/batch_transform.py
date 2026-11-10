@@ -804,7 +804,7 @@ class BaseBatchTransformStep(ComputeStep):
         idx: IndexDF,
     ) -> List[pd.DataFrame]:
         """Capture source metadata rows that can affect this batch."""
-        versions = []
+        versions: List[pd.DataFrame] = []
         for compute_input in self.input_dts:
             input_dt = compute_input.dt
             input_idx = self._input_idx_for_batch(compute_input, idx)
@@ -839,7 +839,7 @@ class BaseBatchTransformStep(ComputeStep):
                 if not key_columns or len(input_idx) == 0:
                     continue
 
-                lock_sql = select(*input_dt.meta_table.sql_schema)
+                lock_sql = select(*input_dt.meta_table.sql_schema)  # type: ignore[call-overload]
                 lock_sql = sql_apply_idx_filter_to_table(
                     lock_sql,
                     input_dt.meta_table.sql_table,
