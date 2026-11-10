@@ -4,6 +4,7 @@ import itertools
 import logging
 import math
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -41,6 +42,7 @@ from datapipe.meta.sql_meta import (
     build_changed_idx_sql_v2,
 )
 from datapipe.run_config import LabelDict, RunConfig
+from datapipe.sql_util import sql_apply_idx_filter_to_table
 from datapipe.types import (
     ChangeList,
     DataDF,
@@ -57,6 +59,15 @@ from datapipe.types import (
 
 logger = logging.getLogger("datapipe.step.batch_transform")
 tracer = trace.get_tracer("datapipe.step.batch_transform")
+
+# AICODE-NOTE: source rows can change while a user transform is running. A bounded retry
+# re-reads the batch against the new source version; exhausting retries aborts the whole
+# run before its offsets are committed, so a conflicting batch remains retryable.
+_SOURCE_CHANGE_RETRIES = 3
+
+
+class _SourceChangedDuringBatch(RuntimeError):
+    """The source changed while a batch was being transformed."""
 
 
 # TODO подумать, может быть мы хотим дать возможность возвращать итератор TransformResult
@@ -773,6 +784,72 @@ class BaseBatchTransformStep(ComputeStep):
 
         return output_dfs
 
+    def _input_idx_for_batch(self, compute_input: "ComputeInput", idx: IndexDF) -> IndexDF:
+        """Map a transform index to the source table's primary-key columns."""
+        if compute_input.join_keys:
+            idx_cols = list(compute_input.join_keys.keys())
+            if all(idx_col in idx.columns for idx_col in idx_cols):
+                return IndexDF(
+                    idx[idx_cols]
+                    .dropna()
+                    .drop_duplicates()
+                    .rename(columns=compute_input.join_keys)
+                    .reset_index(drop=True)
+                )
+
+        return idx
+
+    def _capture_input_versions(
+        self,
+        idx: IndexDF,
+    ) -> List[pd.DataFrame]:
+        """Capture source metadata rows that can affect this batch."""
+        versions = []
+        for compute_input in self.input_dts:
+            input_dt = compute_input.dt
+            input_idx = self._input_idx_for_batch(compute_input, idx)
+            metadata = input_dt.meta_table.get_metadata(input_idx, include_deleted=True)
+            columns = input_dt.primary_keys + ["hash", "update_ts", "delete_ts"]
+            metadata = metadata[columns].sort_values(input_dt.primary_keys).reset_index(drop=True)
+            versions.append(metadata)
+
+        return versions
+
+    @staticmethod
+    def _input_versions_changed(before: List[pd.DataFrame], after: List[pd.DataFrame]) -> bool:
+        if len(before) != len(after):
+            return True
+
+        return any(not before_df.equals(after_df) for before_df, after_df in zip(before, after))
+
+    @contextmanager
+    def _lock_input_rows(self, ds: DataStore, idx: IndexDF):
+        """Lock source metadata rows while validating and publishing one batch."""
+        # SQLite's SingletonThreadPool returns the same connection for nested reads;
+        # row locks are PostgreSQL-only and would otherwise start a nested transaction.
+        if ds.meta_dbconn.connstr.startswith(("sqlite", "pysqlite")):
+            yield
+            return
+
+        with ds.meta_dbconn.con.begin() as con:
+            for compute_input in self.input_dts:
+                input_dt = compute_input.dt
+                input_idx = self._input_idx_for_batch(compute_input, idx)
+                key_columns = [key for key in input_dt.primary_keys if key in input_idx.columns]
+                if not key_columns or len(input_idx) == 0:
+                    continue
+
+                lock_sql = select(*input_dt.meta_table.sql_schema)
+                lock_sql = sql_apply_idx_filter_to_table(
+                    lock_sql,
+                    input_dt.meta_table.sql_table,
+                    key_columns,
+                    input_idx,
+                ).with_for_update()
+                con.execute(lock_sql).fetchall()
+
+            yield
+
     def process_batch(
         self,
         ds: DataStore,
@@ -782,17 +859,43 @@ class BaseBatchTransformStep(ComputeStep):
         with tracer.start_as_current_span("process batch"):
             logger.debug(f"Idx to process: {idx.to_records()}")
 
-            process_ts = time.time()
+            for attempt in range(_SOURCE_CHANGE_RETRIES):
+                process_ts = time.time()
 
-            try:
-                output_dfs = self.process_batch_dts(ds, idx, run_config)
+                try:
+                    source_versions = self._capture_input_versions(idx)
+                    output_dfs = self.process_batch_dts(ds, idx, run_config)
 
-                return self.store_batch_result(ds, idx, output_dfs, process_ts, run_config)
+                    # Keep the validation and publication under source row locks. A writer that
+                    # arrives after the lock is acquired is ordered after this batch; a writer
+                    # that committed before the lock is detected and causes a fresh transform.
+                    with self._lock_input_rows(ds, idx):
+                        current_versions = self._capture_input_versions(idx)
+                        if self._input_versions_changed(source_versions, current_versions):
+                            if attempt + 1 < _SOURCE_CHANGE_RETRIES:
+                                logger.info(
+                                    "Source changed during transform %s for idx %s; retrying batch (%s/%s)",
+                                    self.get_name(),
+                                    idx.to_records(),
+                                    attempt + 1,
+                                    _SOURCE_CHANGE_RETRIES,
+                                )
+                                continue
 
-            except Exception as e:
-                self.store_batch_err(ds, idx, e, process_ts, run_config)
+                            raise _SourceChangedDuringBatch(
+                                f"Source changed during transform {self.get_name()} for idx {idx.to_records()}"
+                            )
 
-                return ChangeList()
+                        return self.store_batch_result(ds, idx, output_dfs, process_ts, run_config)
+
+                except _SourceChangedDuringBatch:
+                    raise
+                except Exception as e:
+                    self.store_batch_err(ds, idx, e, process_ts, run_config)
+
+                    return ChangeList()
+
+            raise AssertionError("source-change retry loop exhausted without returning or raising")
 
     def run_full(
         self,
