@@ -808,8 +808,15 @@ class BaseBatchTransformStep(ComputeStep):
         for compute_input in self.input_dts:
             input_dt = compute_input.dt
             input_idx = self._input_idx_for_batch(compute_input, idx)
-            metadata = input_dt.meta_table.get_metadata(input_idx, include_deleted=True)
             columns = input_dt.primary_keys + ["hash", "update_ts", "delete_ts"]
+            if not all(key in input_idx.columns for key in input_dt.primary_keys):
+                # AICODE-NOTE: keyless/global transforms consume the whole input and have no
+                # finite row set to fingerprint. Avoid turning them into a full meta-table scan;
+                # the source-version guard applies to keyed batches only.
+                versions.append(pd.DataFrame(columns=columns))
+                continue
+
+            metadata = input_dt.meta_table.get_metadata(input_idx, include_deleted=True)
             metadata = metadata[columns].sort_values(input_dt.primary_keys).reset_index(drop=True)
             versions.append(metadata)
 
