@@ -33,7 +33,7 @@ def update_external_table(ds: DataStore, table: DataTable, run_config: Optional[
         table.meta_table.update_rows(
             cast(
                 MetadataDF,
-                pd.concat(df for df in [new_meta_df, changed_meta_df] if not df.empty),
+                pd.concat([new_meta_df, changed_meta_df]),
             ),
         )
 
